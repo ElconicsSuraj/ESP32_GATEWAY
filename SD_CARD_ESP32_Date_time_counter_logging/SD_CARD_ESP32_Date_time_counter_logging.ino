@@ -3,6 +3,7 @@
 #include "SPI.h"
 #include <WiFi.h>
 #include "time.h"
+#include <Preferences.h>
 
 const char* ssid     = "AMP_WiFi";
 const char* password = "amoghmp98";
@@ -14,11 +15,13 @@ const int   daylightOffset_sec = 0;
 
 // Update interval
 unsigned long lastSync = 0;
-const unsigned long syncInterval = 3UL * 60UL * 60UL * 1000UL; // 3 hours in ms
+const unsigned long syncInterval = 3UL * 60UL * 60UL * 1000UL; // 3 hours
 unsigned long lastWrite = 0;
 
-File dataFile;
+Preferences prefs;
 uint32_t counter = 0;
+
+String currentLogFile = "";
 
 void initWiFi() {
   WiFi.begin(ssid, password);
@@ -49,36 +52,58 @@ void updateRTC() {
   }
 }
 
-String getTimeStamp() {
+String getDateStamp() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
-    return "00-00-0000,00:00:00";
+    return "00-00-0000";
   }
-  char buffer[30];
-  strftime(buffer, sizeof(buffer), "%d-%m-%Y,%H:%M:%S", &timeinfo);
+  char buffer[15];
+  strftime(buffer, sizeof(buffer), "%d-%m-%Y", &timeinfo);
   return String(buffer);
 }
 
-void writeHeader() {
-  if (!SD.exists("/log.csv")) {
-    File file = SD.open("/log.csv", FILE_WRITE);
+String getTimeStamp() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "00:00:00";
+  }
+  char buffer[15];
+  strftime(buffer, sizeof(buffer), "%H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+String getLogFileName() {
+  return "/log_" + getDateStamp() + ".csv";
+}
+
+void writeHeader(String filename) {
+  if (!SD.exists(filename)) {
+    File file = SD.open(filename, FILE_WRITE);
     if (file) {
       file.println("Date,Time,Counter");
       file.close();
-      Serial.println("Header written to log.csv");
+      Serial.println("Header written to " + filename);
     }
   }
 }
 
 void appendLog() {
-  File file = SD.open("/log.csv", FILE_APPEND);
+  String todayFile = getLogFileName();
+
+  // If date changed → switch to new file
+  if (todayFile != currentLogFile) {
+    currentLogFile = todayFile;
+    writeHeader(currentLogFile);
+  }
+
+  File file = SD.open(currentLogFile, FILE_APPEND);
   if (file) {
-    String line = getTimeStamp() + "," + String(counter);
+    String line = getDateStamp() + "," + getTimeStamp() + "," + String(counter);
     file.println(line);
     file.close();
     Serial.println(line);
   } else {
-    Serial.println("Failed to open log.csv for appending");
+    Serial.println("Failed to open " + currentLogFile + " for appending");
   }
 }
 
@@ -90,12 +115,19 @@ void setup() {
     return;
   }
 
+  // --- Load counter from NVS ---
+  prefs.begin("my-app", false); // namespace
+  counter = prefs.getUInt("counter", 0); // default = 0
+  Serial.printf("Restored counter = %u\n", counter);
+
   initWiFi();
   initTime();       // Sync NTP once at boot
-  WiFi.disconnect(true); // turn off WiFi after sync to save power
+  WiFi.disconnect(true); // turn off WiFi after sync
   lastSync = millis();
 
-  writeHeader();
+  // Setup today's log file
+  currentLogFile = getLogFileName();
+  writeHeader(currentLogFile);
 }
 
 void loop() {
@@ -105,6 +137,10 @@ void loop() {
   if (now - lastWrite >= 1000) {
     counter++;
     appendLog();
+
+    // Save to flash every second (safe for ESP32 Preferences)
+    prefs.putUInt("counter", counter);
+
     lastWrite = now;
   }
 
