@@ -1,0 +1,23 @@
+function readSensor() {
+  Puck.accelOn(); // Turn on accelerometer + gyro
+
+  setTimeout(function() {
+    function handleAccel(a) {
+      // Print only integers
+      console.log(
+        "ACC:", a.acc.x|0, a.acc.y|0, a.acc.z|0,
+        "GYRO:", a.gyro.x|0, a.gyro.y|0, a.gyro.z|0
+      );
+
+      // Turn off sensor + cleanup
+      Puck.accelOff();
+      Puck.removeListener('accel', handleAccel);
+    }
+
+    Puck.on('accel', handleAccel);
+  }, 200);
+}
+
+// Call every 10 seconds
+setInterval(readSensor, 300000);
+readSensor();
