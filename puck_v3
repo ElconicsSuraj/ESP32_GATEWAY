@@ -1,0 +1,26 @@
+function readSensor() {
+  // Turn on accelerometer + gyro
+  Puck.accelOn();
+
+  setTimeout(function() {
+    function handleAccel(a) {
+      // Send clean data without escape codes
+      Bluetooth.println(
+        "ACC:" + (a.acc.x|0) + " " + (a.acc.y|0) + " " + (a.acc.z|0) +
+        " GYRO:" + (a.gyro.x|0) + " " + (a.gyro.y|0) + " " + (a.gyro.z|0)
+      );
+
+      // Turn off sensor + cleanup
+      Puck.accelOff();
+      Puck.removeListener('accel', handleAccel);
+    }
+
+    Puck.on('accel', handleAccel);
+  }, 200); // wait 200ms after turning on sensor
+}
+
+// Call every 15 seconds
+setInterval(readSensor, 15000);
+
+// Call immediately at start
+readSensor();
