@@ -1,0 +1,39 @@
+function readTemperature() {
+  // Read temperature from the built-in MCU sensor
+  var temp = E.getTemperature();
+
+}
+
+function readSensor() {
+  // Turn on accelerometer + gyro
+  Puck.accelOn();
+
+  setTimeout(function() {
+    function handleAccel(a) {
+      // Read both IMU and chip temperature
+      var tempIMU = Puck.getTemperature();     // from IMU's internal sensor
+      var tempMCU = E.getTemperature();        // from nRF52 MCU internal sensor
+
+      // Send clean data over BLE
+      Bluetooth.println(
+        "ACC:" + (a.acc.x|0) + " " + (a.acc.y|0) + " " + (a.acc.z|0) +
+        " GYRO:" + (a.gyro.x|0) + " " + (a.gyro.y|0) + " " + (a.gyro.z|0) +
+        " TEMP:" + tempMCU.toFixed(2) + "°C"
+      );
+
+      // Turn off sensor + cleanup
+      Puck.accelOff();
+      Puck.removeListener('accel', handleAccel);
+    }
+
+    Puck.on('accel', handleAccel);
+  }, 200); // wait 200ms after turning on sensor
+}
+
+// Call both functions every 15 seconds
+setInterval(readSensor, 15000);
+setInterval(readTemperature, 15000);
+
+// Call immediately at start
+readSensor();
+readTemperature();
