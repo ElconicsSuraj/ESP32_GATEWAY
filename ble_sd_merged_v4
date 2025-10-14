@@ -1,0 +1,249 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <WiFi.h>
+#include "time.h"
+#include <Preferences.h>
+#include "FS.h"
+#include "SD.h"
+#include <ArduinoJson.h>
+
+// ---------------------- Global -----------------------
+String bleBuffer = "";   // global buffer
+#define LED_PIN 2         // onboard LED
+String latestBLEData = "";
+bool newDataAvailable = false;
+
+// ---------------------- BLE Section -----------------
+static BLEUUID serviceUUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+static BLEUUID charUUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
+
+static boolean doConnect = false;
+static boolean connected = false;
+static BLERemoteCharacteristic* pRemoteCharacteristic;
+static BLEAdvertisedDevice* myDevice;
+
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) { Serial.println("Connected to Puck.js!"); }
+  void onDisconnect(BLEClient* pclient) { connected = false; Serial.println("Disconnected from Puck.js!"); }
+};
+
+static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
+  for (size_t i = 0; i < length; i++) {
+    char c = (char)pData[i];
+    if (c == '\n' || c == '\r') {
+      if (bleBuffer.length() > 0) {
+        bleBuffer.trim();
+        while (bleBuffer.length() > 0 && bleBuffer[0] < 32) bleBuffer.remove(0, 1);
+
+        if (!bleBuffer.startsWith("ACC:") || bleBuffer.indexOf("GYRO:") < 0 || bleBuffer.indexOf("TEMP:") < 0) {
+          Serial.println("⚠️ Invalid format, discarded.");
+          bleBuffer = "";
+          return;
+        }
+
+        latestBLEData = bleBuffer;
+        newDataAvailable = true;
+
+        digitalWrite(LED_PIN, HIGH);
+        delay(50);
+        digitalWrite(LED_PIN, LOW);
+
+        bleBuffer = "";
+      }
+    } else {
+      bleBuffer += c;
+    }
+  }
+}
+
+bool connectToServer() {
+  BLEClient* pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new MyClientCallback());
+
+  if (!pClient->connect(myDevice)) { Serial.println("Failed to connect."); return false; }
+
+  BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
+  if (!pRemoteService) { Serial.println("Service not found."); return false; }
+
+  pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
+  if (!pRemoteCharacteristic) { Serial.println("Characteristic not found."); return false; }
+
+  if (pRemoteCharacteristic->canNotify()) pRemoteCharacteristic->registerForNotify(notifyCallback);
+
+  connected = true;
+  return true;
+}
+
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
+      Serial.println("Found Puck.js!");
+      BLEDevice::getScan()->stop();
+      myDevice = new BLEAdvertisedDevice(advertisedDevice);
+      doConnect = true;
+    }
+  }
+};
+
+// ---------------------- WiFi + NTP -------------------
+const char* ssid = "AMP_WiFi";
+const char* password = "amoghmp98";
+
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 19800;
+const int   daylightOffset_sec = 0;
+
+unsigned long lastSync = 0;
+const unsigned long syncInterval = 3UL * 60UL * 60UL * 1000UL; // 3 hours
+
+void initWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi ..");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if (millis() - start > 10000) ESP.restart();
+  }
+  Serial.println(" Connected");
+}
+
+void initTime() {
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.print("Waiting for NTP time sync");
+  struct tm timeinfo;
+  int retries = 0;
+  while (!getLocalTime(&timeinfo) && retries < 10) {
+    Serial.print(".");
+    delay(1000);
+    retries++;
+  }
+  if (retries >= 10) Serial.println("\n⚠️ Failed to sync time!");
+  else Serial.println("\n✅ Time synchronized!");
+}
+
+String getDateStamp() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "00-00-0000";
+  char buffer[15]; strftime(buffer, sizeof(buffer), "%d-%m-%Y", &timeinfo);
+  return String(buffer);
+}
+
+String getTimeStamp() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "00:00:00";
+  char buffer[15]; strftime(buffer, sizeof(buffer), "%H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+// ---------------------- SD Logging -------------------
+Preferences prefs;
+uint32_t counter = 0;
+String currentLogFile = "";
+unsigned long lastWrite = 0;
+
+String getLogFileName() { return "/log_" + getDateStamp() + ".csv"; }
+
+void writeHeader(String filename) {
+  if (!SD.exists(filename)) {
+    File file = SD.open(filename, FILE_WRITE);
+    if (file) {
+      file.println("Date,Time,Counter,AccX,AccY,AccZ,GyroX,GyroY,GyroZ,Temperature(°C)");
+      file.close();
+      Serial.println("Header written to " + filename);
+    }
+  }
+}
+
+void appendLog() {
+  if (!newDataAvailable) return;
+
+  String data = latestBLEData;
+  newDataAvailable = false;
+
+  int accX = 0, accY = 0, accZ = 0;
+  int gyroX = 0, gyroY = 0, gyroZ = 0;
+  float temp = 0.0;
+
+  int firstAcc = data.indexOf("ACC:");
+  int firstGyro = data.indexOf("GYRO:");
+  int firstTemp = data.indexOf("TEMP:");
+
+  if (firstAcc >= 0 && firstGyro > firstAcc && firstTemp > firstGyro) {
+    String accStr = data.substring(firstAcc + 4, firstGyro);
+    String gyroStr = data.substring(firstGyro + 5, firstTemp);
+    String tempStr = data.substring(firstTemp + 5);
+
+    sscanf(accStr.c_str(), "%d %d %d", &accX, &accY, &accZ);
+    sscanf(gyroStr.c_str(), "%d %d %d", &gyroX, &gyroY, &gyroZ);
+    sscanf(tempStr.c_str(), "%f", &temp);
+  } else {
+    Serial.println("⚠️ Parsing error, structure invalid.");
+    return;
+  }
+
+  String todayFile = getLogFileName();
+  if (todayFile != currentLogFile) {
+    currentLogFile = todayFile;
+    writeHeader(currentLogFile);
+  }
+
+  File file = SD.open(currentLogFile, FILE_APPEND);
+  if (file) {
+    String line = getDateStamp() + "," + getTimeStamp() + "," + String(counter) + "," +
+                  String(accX) + "," + String(accY) + "," + String(accZ) + "," +
+                  String(gyroX) + "," + String(gyroY) + "," + String(gyroZ) + "," +
+                  String(temp, 2);
+    file.println(line);
+    file.close();
+    Serial.println("😀 Logged: " + line);
+
+    counter++;
+    prefs.putUInt("counter", counter);
+  } else Serial.println("🥶 Failed to open file for appending");
+}
+
+// ---------------------- Setup & Loop -----------------
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  BLEDevice::init("");
+  BLEScan* pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setActiveScan(true);
+  pBLEScan->start(30, false);
+
+  if (!SD.begin(5)) { Serial.println("Card Mount Failed"); return; }
+
+  prefs.begin("my-app", false);
+  counter = prefs.getUInt("counter", 0);
+  Serial.printf("Restored counter = %u\n", counter);
+
+  currentLogFile = getLogFileName();
+  writeHeader(currentLogFile);
+
+  initWiFi();
+  initTime();
+  lastSync = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (doConnect) {
+    if (connectToServer()) Serial.println("Connected and ready for notifications.");
+    doConnect = false;
+  }
+
+  if (now - lastWrite >= 1000) { appendLog(); lastWrite = now; }
+
+  if (now - lastSync >= syncInterval) {
+    initWiFi();
+    initTime();
+    lastSync = now;
+  }
+
+  delay(10);
+}
