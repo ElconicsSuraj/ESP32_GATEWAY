@@ -1,0 +1,209 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <WiFi.h>
+#include "RTClib.h"
+#include <Preferences.h>
+#include "FS.h"
+#include "SD.h"
+
+// ---------------------- Global -----------------------
+String bleBuffer = "";
+#define LED_PIN 2
+String latestBLEData = "";
+bool newDataAvailable = false;
+
+// ---------------------- BLE Section -----------------
+static BLEUUID serviceUUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+static BLEUUID charUUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
+
+static boolean doConnect = false;
+static BLERemoteCharacteristic* pRemoteCharacteristic;
+static BLEAdvertisedDevice* myDevice;
+
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) { Serial.println("Connected!"); }
+  void onDisconnect(BLEClient* pclient) { Serial.println("Disconnected!"); }
+};
+
+static void notifyCallback(BLERemoteCharacteristic*, uint8_t* pData, size_t length, bool) {
+  for (size_t i = 0; i < length; i++) {
+    char c = (char)pData[i];
+    if (c == '\n' || c == '\r') {
+      if (bleBuffer.length() > 0) {
+        bleBuffer.trim();
+        if (!bleBuffer.startsWith("ACC:") || bleBuffer.indexOf("GYRO:") < 0 || bleBuffer.indexOf("TEMP:") < 0) {
+          bleBuffer = ""; return;
+        }
+        latestBLEData = bleBuffer;
+        newDataAvailable = true;
+        bleBuffer = "";
+      }
+    } else bleBuffer += c;
+  }
+}
+
+bool connectToServer() {
+  BLEClient* pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new MyClientCallback());
+  if (!pClient->connect(myDevice)) return false;
+  BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
+  if (!pRemoteService) return false;
+  pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
+  if (!pRemoteCharacteristic) return false;
+  pRemoteCharacteristic->registerForNotify(notifyCallback);
+  return true;
+}
+
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
+      BLEDevice::getScan()->stop();
+      myDevice = new BLEAdvertisedDevice(advertisedDevice);
+      doConnect = true;
+    }
+  }
+};
+
+// ---------------------- RTC Section -------------------
+RTC_DS3231 rtc;
+
+// ---------------------- SD LOGGING -------------------
+Preferences prefs;
+uint32_t counter = 0;
+String currentLogFile = "";
+
+String getDateStampRTC(){
+  DateTime now = rtc.now();
+  char buf[16];
+  snprintf(buf,sizeof(buf),"%04d-%02d-%02d",now.year(),now.month(),now.day());
+  return String(buf);
+}
+String getTimeStampRTC(){
+  DateTime now = rtc.now();
+  char buf[16];
+  snprintf(buf,sizeof(buf),"%02d:%02d:%02d",now.hour(),now.minute(),now.second());
+  return String(buf);
+}
+
+String getLogFileName(){ return "/log_" + getDateStampRTC() + ".csv"; }
+
+// ---------------------- Kalman Filter --------------------
+class Kalman {
+public:
+  float angle = 0, bias = 0;
+  float P[2][2] = {{0,0},{0,0}};
+  const float Q_angle = 0.001, Q_bias = 0.003, R_measure = 0.03;
+
+  float getAngle(float newAngle, float newRate, float dt) {
+    float rate = newRate - bias;
+    angle += dt * rate;
+
+    P[0][0] += dt*(dt*P[1][1] - P[0][1] - P[1][0] + Q_angle);
+    P[0][1] -= dt*P[1][1];
+    P[1][0] -= dt*P[1][1];
+    P[1][1] += Q_bias * dt;
+
+    float S = P[0][0] + R_measure;
+    float K0 = P[0][0] / S;
+    float K1 = P[1][0] / S;
+    float y = newAngle - angle;
+
+    angle += K0 * y;
+    bias += K1 * y;
+    float P00_temp = P[0][0];
+    float P01_temp = P[0][1];
+    P[0][0] -= K0 * P00_temp;
+    P[0][1] -= K0 * P01_temp;
+    P[1][0] -= K1 * P00_temp;
+    P[1][1] -= K1 * P01_temp;
+
+    return angle;
+  }
+};
+
+Kalman kalPitch, kalRoll;
+unsigned long lastT = 0;
+
+// CSV header
+void writeHeader(String filename){
+  if(!SD.exists(filename)){
+    File file = SD.open(filename, FILE_WRITE);
+    file.println("Date,Time,Counter,Pitch_deg,Roll_deg,Temperature_C");
+    file.close();
+  }
+}
+
+// ---------------------- LOG FUNCTION -------------------
+void appendLog(){
+  if(!newDataAvailable) return;
+  newDataAvailable = false;
+
+  int ax, ay, az, gx, gy, gz;
+  float temp;
+
+  int pA = latestBLEData.indexOf("ACC:");
+  int pG = latestBLEData.indexOf("GYRO:");
+  int pT = latestBLEData.indexOf("TEMP:");
+
+  sscanf(latestBLEData.substring(pA+4,pG).c_str(),"%d %d %d",&ax,&ay,&az);
+  sscanf(latestBLEData.substring(pG+5,pT).c_str(),"%d %d %d",&gx,&gy,&gz);
+  sscanf(latestBLEData.substring(pT+5).c_str(),"%f",&temp);
+
+  gx = gx / 131.0;  // deg/s
+  gy = gy / 131.0;
+  // gz ignored for P/R
+
+  float pitchAcc = atan2(ay, az) * 57.2958;
+  float rollAcc  = atan2(-ax, sqrt(ay*ay + az*az)) * 57.2958;
+
+  unsigned long nowT = millis();
+  if(lastT == 0) lastT = nowT;
+  float dt = (nowT - lastT) / 1000.0;
+  lastT = nowT;
+
+  float pitch = kalPitch.getAngle(pitchAcc, gx, dt);
+  float roll  = kalRoll.getAngle(rollAcc, gy, dt);
+
+  String today = getLogFileName();
+  if(today != currentLogFile){ currentLogFile = today; writeHeader(currentLogFile); }
+
+  File file = SD.open(currentLogFile, FILE_APPEND);
+  if(file){
+    String line = getDateStampRTC() + "," + getTimeStampRTC() + "," + String(counter) + "," +
+                  String(pitch,2) + "," + String(roll,2) + "," + String(temp,2);
+    file.println(line);
+    file.close();
+    Serial.println("LOG: " + line);
+    counter++;
+    prefs.putUInt("counter", counter);
+  }
+}
+
+// ---------------------- SETUP / LOOP -------------------
+void setup(){
+  Serial.begin(115200);
+  pinMode(LED_PIN,OUTPUT);
+
+  BLEDevice::init("");
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  scan->setActiveScan(true);
+  scan->start(30,false);
+
+  if(!SD.begin(5)){ Serial.println("SD FAIL"); return; }
+  prefs.begin("my-app", false);
+  counter = prefs.getUInt("counter",0);
+  currentLogFile = getLogFileName();
+  writeHeader(currentLogFile);
+
+  if(!rtc.begin()) while(true);
+  if(rtc.lostPower()) Serial.println("RTC lost power, set once!");
+}
+
+void loop(){
+  if(doConnect){
+    if(connectToServer()) Serial.println("BLE Connected.");
+    doConnect = false;
+  }
+  appendLog();
+}
