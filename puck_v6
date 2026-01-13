@@ -1,0 +1,44 @@
+//E.setDeepSleep(true);
+
+// ---------------- Power Optimizations ----------------
+LED1.write(0);
+LED2.write(0);
+LED3.write(0);
+NRF.setTxPower(-8);
+// -----------------------------------------------------
+
+var cycleCount = 0;
+
+function readAndSend() {
+  Puck.accelOn();
+
+  setTimeout(function () {
+    function handleAccel(a) {
+      var tempMCU = E.getTemperature();
+
+      var msg =
+        "ACC:" + (a.acc.x|0) + " " + (a.acc.y|0) + " " + (a.acc.z|0) +
+        " GYRO:" + (a.gyro.x|0) + " " + (a.gyro.y|0) + " " + (a.gyro.z|0) +
+        " TEMP:" + tempMCU.toFixed(2);
+
+      cycleCount++;
+      if (cycleCount >= 2) {
+        msg += " BATT:" + Puck.getBatteryPercentage();
+        cycleCount = 0;
+      }
+
+      Bluetooth.println(msg);
+
+      Puck.removeListener("accel", handleAccel);
+      Puck.accelOff();
+    }
+    Puck.on("accel", handleAccel);
+  }, 50);
+}
+
+clearInterval();
+setInterval(readAndSend, 30 * 1000);
+readAndSend();
+
+// ⚠️ RUN THIS ONCE, THEN REMOVE IT
+// save();
