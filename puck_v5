@@ -1,0 +1,40 @@
+// ---------------- Power Optimizations ----------------
+LED1.write(0);
+LED2.write(0);
+LED3.write(0);
+
+NRF.setTxPower(-8);   // Reduce BLE transmit power
+// -----------------------------------------------------
+
+function readAndSend() {
+
+  Puck.accelOn();
+
+  setTimeout(function () {
+
+    function handleAccel(a) {
+      var tempMCU = E.getTemperature();
+
+      // SAME FORMAT AS YOUR ORIGINAL OUTPUT
+      Bluetooth.println(
+        "ACC:" + (a.acc.x|0) + " " + (a.acc.y|0) + " " + (a.acc.z|0) +
+        " GYRO:" + (a.gyro.x|0) + " " + (a.gyro.y|0) + " " + (a.gyro.z|0) +
+        " TEMP:" + tempMCU.toFixed(2)
+      );
+
+      // Cleanup immediately
+      Puck.removeListener("accel", handleAccel);
+      Puck.accelOff();
+      // No Bluetooth.sleep() needed
+    }
+
+    Puck.on("accel", handleAccel);
+
+  }, 50); // minimal sensor settle time
+}
+
+// Every 5 minutes
+setInterval(readAndSend, 5 * 60 * 1000);
+
+// Run once on boot
+readAndSend();
