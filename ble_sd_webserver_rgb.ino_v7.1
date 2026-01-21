@@ -1,0 +1,568 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <FS.h>
+#include <SD.h>
+#include <SPI.h>
+#include <Preferences.h>
+#include "RTClib.h"
+#include <math.h>
+#include <time.h>
+#include "esp_bt.h"
+
+/* ================= CONFIG ================= */
+#define LED_PIN       2
+#define LED_R 2
+#define LED_G 26
+#define LED_B 25
+
+#define SD_CS_PIN     5
+#define BOOT_BTN      4
+
+#define WEB_SESSION_MS (3 * 60 * 1000UL)   // 3 minutes
+
+const char* WIFI_SSID = "Elconics";
+const char* WIFI_PASS = "Elconics@123";
+
+const char* AP_SSID = "EGG-ROTATION-TRACKER";
+const char* AP_PASS = "12345678";
+/* ========================================== */
+
+/* ================= BLE UUIDs ================= */
+static BLEUUID serviceUUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+static BLEUUID charUUID   ("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
+/* ============================================= */
+
+#define PACKET_LEN 17
+#define HDR1 0xAA
+#define HDR2 0x55
+
+/* ================= MODES ================= */
+enum RUN_MODE {
+  MODE_BLE,
+  MODE_WEB
+};
+
+RUN_MODE currentMode = MODE_BLE;
+
+/* ================= GLOBALS ================= */
+uint8_t pkt[PACKET_LEN];
+uint8_t idx = 0;
+
+enum RX_STATE { WAIT_H1, WAIT_H2, READ_BODY };
+RX_STATE rxState = WAIT_H1;
+
+BLEAdvertisedDevice* myDevice = nullptr;
+bool doConnect = false;
+
+RTC_DS3231 rtc;
+Preferences prefs;
+uint32_t packetCounter = 0;
+
+WebServer server(80);
+unsigned long webStartTime = 0;
+
+/* ================= LED ================= */
+void blinkLED(uint8_t n = 1) {
+  while (n--) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(40);
+    digitalWrite(LED_PIN, LOW);
+    delay(40);
+  }
+}
+
+/* ================= RTC HELPERS ================= */
+String rtcDate() {
+  DateTime n = rtc.now();
+  char b[16];
+  sprintf(b, "%04d-%02d-%02d", n.year(), n.month(), n.day());
+  return String(b);
+}
+
+String rtcTime() {
+  DateTime n = rtc.now();
+  char b[16];
+  sprintf(b, "%02d:%02d:%02d", n.hour(), n.minute(), n.second());
+  return String(b);
+}
+
+/* ================= WIFI → RTC SYNC ================= */
+
+
+void syncRTCFromInternet() {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0 = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+    delay(500);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  //  IST = UTC + 5:30
+  #define IST_OFFSET_SEC  (5 * 3600 + 30 * 60)
+  configTime(IST_OFFSET_SEC, 0, "pool.ntp.org", "time.nist.gov");
+
+  struct tm ti;
+  if (!getLocalTime(&ti, 10000)) return;
+
+  //  This stays EXACTLY the same
+  rtc.adjust(DateTime(
+    ti.tm_year + 1900,
+    ti.tm_mon + 1,
+    ti.tm_mday,
+    ti.tm_hour,
+    ti.tm_min,
+    ti.tm_sec
+  ));
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
+
+
+/* ================= BLE NOTIFY ================= */
+static void notifyCallback(
+  BLERemoteCharacteristic*,
+  uint8_t* data,
+  size_t len,
+  bool
+) {
+  for (size_t i = 0; i < len; i++) {
+    uint8_t b = data[i];
+
+    switch (rxState) {
+      case WAIT_H1:
+        if (b == HDR1) rxState = WAIT_H2;
+        break;
+
+      case WAIT_H2:
+        if (b == HDR2) {
+          pkt[0] = HDR1;
+          pkt[1] = HDR2;
+          idx = 2;
+          rxState = READ_BODY;
+        } else rxState = WAIT_H1;
+        break;
+
+      case READ_BODY:
+        pkt[idx++] = b;
+        if (idx == PACKET_LEN) {
+          rxState = WAIT_H1;
+          idx = 0;
+          goto PARSE;
+        }
+        break;
+    }
+  }
+  return;
+
+PARSE:
+  uint8_t cs = 0;
+  for (int i = 2; i <= 15; i++) cs ^= pkt[i];
+  if (cs != pkt[16]) return;
+
+  int16_t ax = pkt[2] | (pkt[3] << 8);
+  int16_t ay = pkt[4] | (pkt[5] << 8);
+  int16_t az = pkt[6] | (pkt[7] << 8);
+  int16_t gx = pkt[8] | (pkt[9] << 8);
+  int16_t gy = pkt[10] | (pkt[11] << 8);
+  int16_t gz = pkt[12] | (pkt[13] << 8);
+  int8_t temp = pkt[14];
+  uint8_t batt = pkt[15];
+
+  packetCounter++;
+  prefs.putUInt("cnt", packetCounter);
+
+  float pitch = atan2(ay, az) * 57.2958;
+  float roll  = atan2(-ax, sqrt(ay * ay + az * az)) * 57.2958;
+
+  String file = "/log_" + rtcDate() + ".csv";
+
+  if (!SD.exists(file)) {
+    File f = SD.open(file, FILE_WRITE);
+    f.println("Date,Time,Count,AX,AY,AZ,GX,GY,GZ,Pitch,Roll,Temp,Battery");
+    f.close();
+  }
+
+  File f = SD.open(file, FILE_APPEND);
+  if (!f) return;
+
+  f.printf(
+    "%s,%s,%lu,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d\n",
+    rtcDate().c_str(), rtcTime().c_str(), packetCounter,
+    ax, ay, az, gx, gy, gz, pitch, roll, temp, batt
+  );
+  f.close();
+
+  blinkLED();
+}
+
+/* ================= BLE CONNECT ================= */
+bool connectToServer() {
+  BLEClient* client = BLEDevice::createClient();
+  if (!client->connect(myDevice)) return false;
+
+  BLERemoteService* svc = client->getService(serviceUUID);
+  if (!svc) return false;
+
+  BLERemoteCharacteristic* ch = svc->getCharacteristic(charUUID);
+  if (!ch) return false;
+
+  ch->registerForNotify(notifyCallback);
+  blinkLED(5);
+  Serial.println("BLE connected");
+  return true;
+}
+
+/* ================= BLE SCAN ================= */
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice dev) {
+    if (dev.haveServiceUUID() && dev.isAdvertisingService(serviceUUID)) {
+      BLEDevice::getScan()->stop();
+      myDevice = new BLEAdvertisedDevice(dev);
+      doConnect = true;
+    }
+  }
+};
+
+/* ================= BLE CONTROL ================= */
+void startBLE() {
+  BLEDevice::init("");
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  scan->setActiveScan(true);
+  scan->start(0);
+  Serial.println("BLE LOGGER MODE");
+  rgbOff();
+  rgbGreen();
+}
+
+void stopBLE() {
+  BLEDevice::deinit(true);
+  btStop();
+  delay(200);
+}
+
+/* ================= WEB UI ================= */
+void handleRoot() {
+  server.send(200, "text/html", R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>ESP32 SD Log Viewer</title>
+<style>
+body {
+  font-family: Arial, sans-serif;
+  background:#f5f6fa;
+  margin:0;
+  padding:20px;
+}
+h2 {
+  color:#2c3e50;
+}
+.container {
+  display:flex;
+  gap:20px;
+}
+.file-list {
+  width:30%;
+  background:#fff;
+  border:1px solid #ccc;
+  height:80vh;
+  overflow:auto;
+}
+.file {
+  padding:10px;
+  border-bottom:1px solid #eee;
+  cursor:pointer;
+}
+.file:hover {
+  background:#ecf0f1;
+}
+.viewer {
+  width:70%;
+  background:#fff;
+  border:1px solid #ccc;
+  padding:10px;
+  overflow:auto;
+}
+button {
+  padding:8px 12px;
+  margin-top:10px;
+  background:#3498db;
+  color:white;
+  border:none;
+  cursor:pointer;
+  border-radius:4px;
+}
+button:hover {
+  background:#2980b9;
+}
+table {
+  border-collapse:collapse;
+  width:100%;
+}
+th, td {
+  border:1px solid #ccc;
+  padding:6px;
+  text-align:center;
+}
+th {
+  background:#006e5f;
+  color:white;
+}
+pre {
+  white-space:pre-wrap;
+}
+@media print {
+  button { display:none; }
+}
+</style>
+</head>
+
+<body>
+<h2>ESP32 SD Card Log Viewer</h2>
+
+<div class="container">
+  <div class="file-list" id="files"></div>
+  <div class="viewer" id="viewer">Select a file</div>
+</div>
+
+<script>
+let currentFile = "";
+
+function loadFiles() {
+  fetch('/api/list')
+    .then(r => r.json())
+    .then(files => {
+      const list = document.getElementById('files');
+      list.innerHTML = '';
+      files.forEach(f => {
+        const div = document.createElement('div');
+        div.className = 'file';
+        div.textContent = f.name + ' (' + f.size + ' bytes)';
+        div.onclick = () => openFile(f.name);
+        list.appendChild(div);
+      });
+    });
+}
+
+function openFile(name) {
+  currentFile = name;
+  fetch('/api/file?name=' + name)
+    .then(r => r.text())
+    .then(text => {
+      const viewer = document.getElementById('viewer');
+      let content = '';
+
+      if (name.endsWith('.csv')) {
+        content = csvToTable(text);
+      } else {
+        content = '<pre>' + text + '</pre>';
+      }
+
+      content += `
+        <br>
+        <button onclick="printLog()">Print</button>
+        <button onclick="downloadFile()">Download</button>
+      `;
+      viewer.innerHTML = content;
+    });
+}
+
+function downloadFile() {
+  window.location.href = '/api/download?name=' + currentFile;
+}
+
+function printLog() {
+  window.print();
+}
+
+function csvToTable(text) {
+  let html = '<table>';
+ const rows = text.trim().split(/\r?\n/);
+ rows.forEach((row, i) => {
+    html += '<tr>';
+    row.split(',').forEach(col => {
+      html += i === 0 ? '<th>' + col + '</th>' : '<td>' + col + '</td>';
+    });
+    html += '</tr>';
+  });
+  html += '</table>';
+  return html;
+}
+
+loadFiles();
+</script>
+</body>
+</html>
+)rawliteral");
+}
+
+
+void handleList() {
+  File root = SD.open("/");
+  String json = "[";
+  while (true) {
+    File f = root.openNextFile();
+    if (!f) break;
+    if (json.length() > 1) json += ",";
+    json += "{\"name\":\"" + String(f.name()) + "\",\"size\":" + String(f.size()) + "}";
+    f.close();
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+void handleFile() {
+  if (!server.hasArg("name")) return server.send(400, "text/plain", "Missing");
+  File f = SD.open("/" + server.arg("name"));
+  if (!f) return server.send(404, "text/plain", "Not found");
+  server.streamFile(f, "text/plain");
+  f.close();
+}
+
+void handleDownload() {
+  if (!server.hasArg("name")) return server.send(400, "text/plain", "Missing");
+  File f = SD.open("/" + server.arg("name"));
+  if (!f) return server.send(404, "text/plain", "Not found");
+  server.sendHeader("Content-Disposition","attachment; filename=\"" + server.arg("name") + "\"");
+  server.streamFile(f, "application/octet-stream");
+  f.close();
+}
+
+/* ================= WEB MODE ================= */
+void startWebServer() {
+  rgbOff();
+  rgbBlue();
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+
+  server.on("/", handleRoot);
+  server.on("/api/list", handleList);
+  server.on("/api/file", handleFile);
+  server.on("/api/download", handleDownload);
+
+  server.begin();
+  webStartTime = millis();
+
+  Serial.print("WEB MODE IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+
+
+void rgbOff() {
+  digitalWrite(LED_R, LOW);
+  digitalWrite(LED_G, LOW);
+  digitalWrite(LED_B, LOW);
+}
+
+void rgbBlue() {
+  rgbOff();
+  digitalWrite(LED_B, HIGH);
+}
+
+void rgbGreen() {
+  rgbOff();
+  digitalWrite(LED_G, HIGH);
+}
+
+void blinkGreen() {
+  digitalWrite(LED_G, HIGH);
+  delay(40);
+  digitalWrite(LED_G, LOW);
+  delay(40);
+}
+
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+    pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BOOT_BTN, INPUT_PULLUP);
+
+  rtc.begin();
+  syncRTCFromInternet();
+
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD FAIL");
+    while (1);
+  }
+
+  prefs.begin("ble-log", false);
+  packetCounter = prefs.getUInt("cnt", 0);
+
+  startBLE();
+}
+
+/* ================= LOOP ================= */
+void loop() {
+
+  if (currentMode == MODE_BLE) {
+    if (doConnect) {
+      connectToServer();
+      doConnect = false;
+    }
+
+    if (digitalRead(BOOT_BTN) == LOW) {
+      delay(50);
+      rgbOff();
+      if (digitalRead(BOOT_BTN) == LOW) {
+        blinkLED(3);
+        stopBLE();
+        startWebServer();
+        currentMode = MODE_WEB;
+      }
+    }
+  }
+
+  else if (currentMode == MODE_WEB) {
+    server.handleClient();
+    if (millis() - webStartTime > WEB_SESSION_MS) {
+      ESP.restart();
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
